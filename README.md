@@ -49,4 +49,4 @@ This speaks volumes to just how much pitchers are able to manipulate their pitch
 
 ### Code & Figures
 
-All code can be found in the .rmd file. Code with figures included can be found in the .pdf document compiled from R. 
+All code can be found in the .rmd file.
