@@ -1,4 +1,4 @@
-# MLB-Pitch-Classification-Model
+# MLB-Pitch-Classification-Model-R
 Using machine learning modeling to classify major league pitch types using real play-by-play data
 
 ## Rationale
@@ -7,7 +7,7 @@ Major League Baseball (MLB) stadiums are equipped with a 12 camera system that c
 
 ### But, how do their systems know which pitch was thrown, and which metrics are most influential in allowing these systems to identify a pitch? 
 
-The aim of this project was to create a machine learning model that can identify MLB pitches using real MLB data scraped from baseballsavant.mlb.com, to understand which metrics are the most important when identifying a pitch in the major leagues. 
+The aim of this project was to create a machine learning model that can classify MLB pitches using real MLB play-by-play data scraped from baseballsavant.mlb.com, to understand which metrics are the most important when identifying/classifying a pitch in the major leagues. 
 
 ## Data Definitions
 
