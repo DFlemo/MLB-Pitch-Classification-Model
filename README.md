@@ -46,3 +46,7 @@ Our model could identify MLB pitches with just under 92% accuracy. These innacur
 - Horizontal movement in feet from the catcher's perspective.
 
 This speaks volumes to just how much pitchers are able to manipulate their pitches, given that the movement on the ball between the mound and the plate are two of the top three metrics. Of course, we all know that velocity plays a large role in pitching, but here it also plays a big role in identifying a pitch also. Overall, this model performed well, correctly classifying 92% of pitches, and even better when identifying the more common pitch types such as four seam fastballs and splitters.
+
+### Code & Figures
+
+All code can be found in the .rmd file. Code with figures included can be found in the .pdf document compiled from R. 
