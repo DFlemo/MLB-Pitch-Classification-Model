@@ -1,0 +1,448 @@
+---
+title: "MLB Pitch Identification Model"
+author: "Daniel Fleming"
+date: "2024-07-27"
+output: pdf
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# MLB Pitch Identification Model
+
+## Rationale
+
+### Major League Baseball (MLB) stadiums are equipped with a 12 camera system that captures data for every pitch thrown in a game. If you've ever watched a major league game, you'll know what the pitch is identified almost instantly by this system both on TV broadcasts and inside the stadium. But how do their systems know which pitch was thrown, and which metrics are most influential in allowing these systems to identify a pitch? 
+
+The aim of this project is to create an effective machine learning model that can identify MLB pitches using real MLB data scraped from baseballsavant.mlb.com, to understand which metrics are the most important when identifying a pitch in the major leagues. 
+
+## Data Definitions
+
+### Data for this project were scraped from baseballsavant.mlb.com and include over 19,000 pitches from the last 5 days of major league play since the 2024 all-star break. 
+
+pitch_name = The name of the pitch derived from the Statcast Data.
+
+release_speed = Pitch velocities from 2008-16 are via Pitch F/X, and adjusted to roughly out-of-hand release point.
+
+release_pos_x = Horizontal Release Position of the ball measured in feet from the catcher's perspective.
+
+release_pos_z = Vertical Release Position of the ball measured in feet from the catcher's perspective.
+
+pfx_x = Horizontal movement in feet from the catcher's perspective.
+
+pfx_z = Vertical movement in feet from the catcher's perpsective.
+
+plate_x = Horizontal position of the ball when it crosses home plate from the catcher's perspective.
+
+plate_z = Vertical position of the ball when it crosses home plate from the catcher's perspective.
+
+release_spin_rate = Spin rate of pitch tracked by Statcast.
+
+release_extension = Release extension of pitch in feet as tracked by Statcast.
+
+spin_axis = The Spin Axis in the 2D X-Z plane in degrees from 0 to 360, such that 180 represents a pure backspin fastball and 0 degrees represents a pure topspin (12-6) curveball
+
+## Key Findings
+
+### Of all metrics gathered by the MLB and statcast, the following appear to be the most important when aiming to classify a pitch type:
+
+- Vertical movement in feet from the catcher's perspective.
+- Pitch velocity
+- Horizontal movement in feet from the catcher's perspective.
+
+This speaks volumes to just how much pitchers are able to manipulate their pitches, given that the movement on the ball between the mound and the plate are two of the top three metrics. Of course, we all know that velocity plays a large role in pitching, but here it also plays a big role in identifying a pitch also. Overall, this model performed well, correctly classifying 92% of pitches, and even better when identifying the more common pitch types such as four seam fastballs and splitters.
+
+## Loading Libraries
+
+```{r}
+library(DBI)
+library(RSQLite)
+library(lubridate)
+library(baseballr)
+library(sportyR)
+library(tidyverse)
+library(caret)
+library(GGally)
+library(kernlab)
+library(randomForest)
+library(ggraph)
+library(igraph)
+```
+
+## Scraping Data from BaseballSavant.mlb.com
+
+### The following chunk connects to the SQLite database to scrape Statcast data using the baseballr package (Petti & Gilani, 2021). For this project, we will use only data collected in the last 5 gamedays in the MLB, which will give us data for around 19,000 pitches.
+
+```{r}
+statcast_write <- function() {
+  # Connect to the SQLite database
+  db <- dbConnect(SQLite(), "statcast.db.sqlite")
+  
+  # Get the previous day's date
+  day <- lubridate::today() - 1
+  message("Scraping data for: ", day)
+  
+  # Scrape Statcast data
+  dat <- tryCatch(
+    {
+      baseballr::scrape_statcast_savant(start_date = '2024-07-22', end_date = day)
+    },
+    error = function(e) {
+      message("Error in scraping data: ", e)
+      return(NULL)
+    }
+  )
+  
+  # Check if data scraping was successful
+  if (is.null(dat)) {
+    message("Data scraping failed.")
+    dbDisconnect(db)
+    return(NULL)
+  }
+  
+  # Print the structure of the data
+  message("Structure of the scraped data:")
+  print(str(dat))
+  
+  # Print first few rows of the data
+  message("First few rows of the scraped data:")
+  print(head(dat))
+  
+  # Ensure that all columns have valid UTF-8 encoding
+  dat <- lapply(dat, function(column) {
+    if (is.character(column)) {
+      Encoding(column) <- "UTF-8"
+    }
+    return(column)
+  })
+  
+  # Convert list back to data frame if necessary
+  if (is.list(dat) && !is.data.frame(dat)) {
+    dat <- as.data.frame(dat)
+  }
+  
+  # Check if the data is a data frame
+  if (!is.data.frame(dat)) {
+    stop("The data returned by scrape_statcast_savant is not a data frame.")
+  }
+  
+  # Write the data to the database
+  tryCatch(
+    {
+      dbWriteTable(db, "statcast_hitting", dat, overwrite = FALSE, row.names = FALSE, append = TRUE)
+    },
+    error = function(e) {
+      message("Error in writing data to the database: ", e)
+    }
+  )
+  
+  # Disconnect from the database
+  dbDisconnect(db)
+  
+  # Return the data frame
+  return(dat)
+}
+
+# Call the function and assign the returned data frame to a variable
+scraped_data <- statcast_write()
+
+```
+### This has given us a dataframe with 19,029 observations of 94 variables. However, not all of these variables are relevant for us when aiming to create a model that will identify the pitch type. For example, this includes the date of the game, the description of the outcome (ball, strike, hit, etc.), and the type of game (regular season vs playoffs). As such, we will trim it down a little to give us a more manageable dataset that contains only variables of interest for our goal. We will include pitch name for now to be used when training our model.
+
+```{r}
+cleandata <- scraped_data %>%
+  dplyr::select(pitch_name, release_speed, release_pos_x, release_pos_z, pfx_x, pfx_z, plate_x, plate_z, release_spin_rate, release_extension, spin_axis)
+```
+
+### Now we have a much tidier dataframe, with just 11 variables that are related to the pitch itself. We'll also remove any incomplete observations.
+
+```{r}
+head(cleandata)
+
+cleandata <- na.omit(cleandata)
+```
+
+
+### Before we move on too far, let me give you some definitions of each variable we've included (baseballsavant.mlb.com, 2024):
+
+pitch_name = The name of the pitch derived from the Statcast Data.
+
+release_speed = Pitch velocities from 2008-16 are via Pitch F/X, and adjusted to roughly out-of-hand release point.
+
+release_pos_x = Horizontal Release Position of the ball measured in feet from the catcher's perspective.
+
+release_pos_z = Vertical Release Position of the ball measured in feet from the catcher's perspective.
+
+pfx_x = Horizontal movement in feet from the catcher's perspective.
+
+pfx_z = Vertical movement in feet from the catcher's perpsective.
+
+plate_x = Horizontal position of the ball when it crosses home plate from the catcher's perspective.
+
+plate_z = Vertical position of the ball when it crosses home plate from the catcher's perspective.
+
+release_spin_rate = Spin rate of pitch tracked by Statcast.
+
+release_extension = Release extension of pitch in feet as tracked by Statcast.
+
+spin_axis = The Spin Axis in the 2D X-Z plane in degrees from 0 to 360, such that 180 represents a pure backspin fastball and 0 degrees represents a pure topspin (12-6) curveball
+
+### Next we need to check the class of the variables. They should all be numeric other than the pitch name, which should be a factor. 
+
+```{r}
+sapply(cleandata, class)
+```
+### The pitch name variable is currently a character. So this will need to be converted to a factor, with the levels checked. 
+
+```{r}
+cleandata$pitch_name = as.factor(cleandata$pitch_name)
+
+levels(cleandata$pitch_name)
+```
+
+### The chunk above shows that we now have the pitch name variable correctly set up as a factor for our modelling process. Now we will summarize the distribution of pitches in these classes, to see which are the most, and least common. 
+
+```{r}
+percentage <- prop.table(table(cleandata$pitch_name)) * 100
+
+cbind(freq = table(cleandata$pitch_name), percentage = percentage)
+```
+
+### As you can see, the most popular pitch in the MLB for this period is the 4-seam fastball, being used 33% of the time. Second is the slider, at 17% and then the sinker at 15%. Now lets get an understanding of some of the other variables that are often discussed in the major leagues. 
+
+```{r}
+summary(cleandata)
+```
+
+### Some interesting observations here, are that on average, MLB pitches are released at just over 89 mph, with a top velocity of 104 in the last 5 gamedays. Pitchers also often manipulate the spin rate of their pitches a lot, you can see here that on average a ball is released with about 2200 rpm, peaking at just under 3500 rpm. To understand this a little better, we can visualize this rather than just using descriptive statistics. 
+
+Below, x will contain our 'predictor' variables, while y will be our dependent/class variable of pitch name. 
+
+```{r}
+x <- cleandata[2:11]
+y <- cleandata[, 1]
+```
+
+```{r}
+par(mfrow = c(2, 5))
+for (i in 2:10) {
+  boxplot(x[, i], main = names(cleandata)[i])
+}
+```
+
+### We can also create a simple barplot of the pitch classes to visualize the frequency of each. 
+
+```{r}
+ggplot(cleandata, aes(x = pitch_name)) +
+  geom_bar() + 
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90))
+```
+
+### Now we can begin to explore the data in a multivariate way, by combining variables. We will plot density plots of each predictor by the different pitch types. 
+
+```{r}
+for (i in 2:ncol(cleandata)) {
+  p <- ggplot(cleandata, aes_string(x = names(cleandata)[i], fill = "pitch_name")) +
+       geom_density(alpha = 0.5) +
+    theme_minimal() + 
+       facet_wrap(~ pitch_name, scales = "free") +
+       labs(x = names(cleandata)[i], y = "Density", title = paste("Density plot of", names(cleandata)[i], "by pitch"))
+  print(p)
+}
+
+```
+
+## Creating Models
+
+### Now we have a good understanding of the data that we are dealing with, it is time to begin working with some models. For this project, we will use 10-fold cross validation where we train our model on 9 subsets of unseen data, followed by testing it with 1 final subset of unseen data. The first step is to set this up.
+
+First we need to split our data into a training set and a validation set. We will keep the validation data set unseen so that we can test our final model on it at the end. We're going to take 80% of the original 19,000 (just over 15,000) observations to serve as our training dataset. We'll then use the final 20% to see how our model performs. 
+
+```{r}
+validation_index <- createDataPartition(cleandata$pitch_name, p=0.80, list=FALSE)
+validation <- cleandata[-validation_index,]
+cleandata <- cleandata[validation_index,]
+```
+
+
+```{r}
+control <- trainControl(method = "cv", number = 10)
+metric <- "Accuracy"
+```
+
+### We will be using 'Accuracy' to test how well our models perform. This will give us the ratio of correctly vs. incorrectly predicted pitches by our models. For this project, we will begin by evaluating 5 algorithms to cover our bases - excuse the pun: 
+
+- Linear Discriminant Analysis (LDA)
+- Classification and Regression Trees (CART)
+- k-Nearest Neighbors (kNN)
+- Support Vector Machines (SVM)
+- Random Forest (RF)
+
+In order to ensure replicability and that each model is run uses the exact same data splits, we will set a seed before each model fit. 
+
+```{r}
+# a) linear algorithms
+set.seed(123)
+fit.lda <- train(pitch_name ~., data = cleandata, method = "lda", metric = metric, trControl = control)
+# b) nonlinear algorithms
+# CART
+set.seed(123)
+fit.cart <- train(pitch_name ~., data = cleandata, method = "rpart", metric = metric, trControl = control)
+# kNN
+set.seed(123)
+fit.knn <- train(pitch_name ~., data = cleandata, method = "knn", metric = metric, trControl = control)
+# c) advanced algorithms
+# SVM
+set.seed(123)
+fit.svm <- train(pitch_name ~., data = cleandata, method = "svmRadial", metric = metric, trControl = control)
+# Random Forest
+set.seed(123)
+fit.rf <- train(pitch_name ~., data = cleandata, method = "rf", metric = metric, trControl = control)
+```
+
+### Now we have specifed, fit, and cross-validated each model, we can examine the results and identify the best performing model. 
+
+```{r}
+results <- resamples(list(lda = fit.lda, cart = fit.cart, knn = fit.knn, svm = fit.svm, rf = fit.rf))
+summary(results)
+```
+
+### We can also plot the model evaluation to examine it visually rather than relying on tables. This will show the spread and mean accuracy of each model. 
+
+```{r}
+dotplot(results)
+```
+
+### Based on both of these, it seems that the Random Forest model was the highest performing, based on evidence from both accuracy and kappa. Lets look at that model in more detail. 
+
+```{r}
+print(fit.rf)
+```
+
+## Predictions and Confusion Matrix - Validation Data
+
+```{r}
+p1 <- predict(fit.rf, validation)
+confusionMatrix(p1, validation$pitch_name)
+```
+
+### We can see here that the model predicts pitches correctly about 92% of the time, which is a great result. Of course, the model seems to struggle most when identifying the lesser used pitches, such as forkball, Eephus, and Slurve, but this is to be expected. 
+
+We can now test to see 
+
+Now we are able to explore the model a little to begin answering our main question. First, lets plot the feature importance, which will tell us which variables are most important in our model's ability to provide a classification. 
+
+```{r}
+importance_values <- varImp(fit.rf, scale = T)
+
+print(importance_values)
+
+# Extract feature importance into a data frame
+importance_df <- as.data.frame(importance_values$importance)
+importance_df$Feature <- rownames(importance_df)
+
+plot(importance_values)
+
+```
+
+### As you can see here, pfx_z has 100% model importance. This is an interesting result as it suggests that the model either perfectly predicts the outcome based on this variable, or there are some issues. One of the most likely issues is that pfx_z is highly correlated with another variable in the dataset. Lets plot a correlation matrix.  
+
+```{r}
+cleandata2 <- cleandata %>%
+  dplyr::select(!pitch_name)
+
+cor(cleandata2)
+```
+
+### This looks like an abnormally high coreelation between pfx_z and another variable isn't the issue. I also fit a model that removed pfx_z and the model accuracy dropped by 2%. For now, it looks as though this isn't an error. 
+
+So, it seems as though the 3 most important statistics to predict a MLB pitch are (in order from most to least important):
+
+- Vertical movement in feet from the catcher's perspective.
+- Pitch velocity
+- Horizontal movement in feet from the catcher's perspective.
+
+## Now to plot the model... this code came from Shirin's playgRound - github here: https://shiring.github.io/machine_learning/2017/03/16/rf_plot_ggraph
+
+```{r}
+tree_func <- function(final_model, 
+                      tree_num) {
+  
+  # get tree by index
+  tree <- randomForest::getTree(final_model, 
+                                k = tree_num, 
+                                labelVar = TRUE) %>%
+    tibble::rownames_to_column() %>%
+    # make leaf split points to NA, so the 0s won't get plotted
+    mutate(`split point` = ifelse(is.na(prediction), `split point`, NA))
+  
+  # prepare data frame for graph
+  graph_frame <- data.frame(from = rep(tree$rowname, 2),
+                            to = c(tree$`left daughter`, tree$`right daughter`))
+  
+  # convert to graph and delete the last node that we don't want to plot
+  graph <- graph_from_data_frame(graph_frame) %>%
+    delete_vertices("0")
+  
+  # set node labels
+  V(graph)$node_label <- gsub("_", " ", as.character(tree$`split var`))
+  V(graph)$leaf_label <- as.character(tree$prediction)
+  V(graph)$split <- as.character(round(tree$`split point`, digits = 2))
+  
+  # plot
+  plot <- ggraph(graph, 'dendrogram') + 
+    theme_bw() +
+    geom_edge_link() +
+    geom_node_point() +
+    geom_node_text(aes(label = node_label), na.rm = TRUE, repel = TRUE) +
+    geom_node_label(aes(label = split), vjust = 2.5, na.rm = TRUE, fill = "Green") +
+    geom_node_label(aes(label = leaf_label, fill = leaf_label), na.rm = TRUE, 
+					repel = TRUE, colour = "white", fontface = "bold", show.legend = FALSE) +
+    theme(panel.grid.minor = element_blank(),
+          panel.grid.major = element_blank(),
+          panel.background = element_blank(),
+          plot.background = element_rect(fill = "white"),
+          panel.border = element_blank(),
+          axis.line = element_blank(),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks = element_blank(),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank(),
+          plot.title = element_text(size = 18))
+  
+  print(plot)
+}
+```
+
+
+```{r}
+tree_num <- which(fit.rf$finalModel$forest$ndbigtree == min(fit.rf$finalModel$forest$ndbigtree))
+
+plot <- tree_func(final_model = fit.rf$finalModel, tree_num)
+  
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
